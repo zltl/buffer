@@ -1,12 +1,12 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "buffer.h"
 
@@ -57,7 +57,8 @@ struct buf_s {
     size_t total_limit;
     int file_enable;
     char *file_path;
-    int fd;
+    struct buf_node *file_node;
+    struct buf_node *node_before_file;
     struct buf_node *head;
     struct buf_node *tail;
 };
@@ -78,8 +79,8 @@ struct buf_node_virtual_func {
 };
 
 #define BUF_NODE_APPLY(n, fname, ...) \
-    n->node_impl.common.virtual_fn_ptr->fname(n, ##__VA_ARGS__)
-#define BUF_NODE_TYPE(n) n->node_impl.common.impl_type
+    (n)->node_impl.common.virtual_fn_ptr->fname(n, ##__VA_ARGS__)
+#define BUF_NODE_TYPE(n) (n)->node_impl.common.impl_type
 
 void buf_node_mem_clear(struct buf_node *n);
 int buf_node_mem_push_data(struct buf_node *n, unsigned char *data, size_t len,
@@ -349,12 +350,13 @@ int buf_init(buf_t *b) {
     b->tail = NULL;
     b->data_in_file = 0;
     b->mem_limit = BUF_DEFAULT_MAX_MEM;
-    b->total_limit = BUF_DEFAULT_MAX_SIZE;
+    b->total_limit = BUF_DEFAULT_MAX_MEM;
     b->file_enable = BUF_DEFAULT_ENABLE_FILE;
     b->file_limit = BUF_DEFAULT_MAX_FILE_SIZE;
     b->file_path = NULL;
     b->len = 0;
-    b->fd = -1;
+    b->file_node = NULL;
+    b->node_before_file = NULL;
 
     return 0;
 }
@@ -402,14 +404,158 @@ int buf_add_node(buf_t *b, struct buf_node *n) {
     return 0;
 }
 
-int buf_write_to_file(buf_t *b) {
-    if (b->fd == -1) {
+int buf_create_file_node(buf_t *b) {
+    int fd = open(b->file_path, O_RDWR | O_CREAT | O_NONBLOCK);
+    if (fd < 0) {
+        return BUF_ERR;
+    }
 
+    struct buf_node *n = (struct buf_node *)malloc(sizeof(struct buf_node));
+    if (n == NULL) {
+        return BUF_EOM;
+    }
+    buf_node_file_init(n, fd, b->file_limit);
+    n->next = b->head;
+    b->head = n;
+    if (b->tail == NULL) {
+        b->tail = b->head;
+    }
+    b->file_node = n;
+    return 0;
+}
+
+int buf_to_file(buf_t *b) {
+    struct buf_node *file_node = NULL;
+
+    if (b->file_node == NULL) {
+        int r = buf_create_file_node(b);
+        if (r < 0) {
+            return r;
+        }
+    }
+    file_node = b->file_node;
+
+    struct buf_node **next = &file_node->next;
+    while (file_node && *next) {
+        if (BUF_NODE_APPLY(*next, get_len)) {
+            size_t cnt;
+            int r = BUF_NODE_APPLY(file_node, push_data,
+                                   (*next)->node_impl.mem.first,
+                                   (*next)->node_impl.mem.len, &cnt);
+            if (r == BUF_OK) {
+                b->data_in_file -= cnt;
+                size_t left = BUF_NODE_APPLY(*next, get_len) - cnt;
+                if (left == 0) {
+                    struct buf_node *t = *next;
+                    *next = (*next)->next;
+                    BUF_NODE_APPLY(t, clear);
+                    free(t);
+                }
+            } else {
+                if (errno == EAGAIN || errno == EINTR) {
+                    return BUF_EAGAIN;
+                }
+            }
+        }
+    }
+    if (file_node->next == NULL) {
+        b->tail = file_node;
+    }
+
+    return 0;
+}
+
+int buf_remove_file_node(buf_t *b) {
+    struct buf_node *file_node = b->file_node;
+    if (b->node_before_file == NULL) {
+        b->head = file_node->next;
+    } else {
+        b->node_before_file->next = file_node->next;
+    }
+
+    close(file_node->node_impl.file.fd);
+    BUF_NODE_APPLY(file_node, clear);
+    free(file_node);
+    unlink(b->file_path);
+    b->data_in_file = 0;
+    b->file_node = NULL;
+    b->node_before_file = NULL;
+
+    return 0;
+}
+
+int buf_has_file(buf_t *b) { return b->file_node != NULL; }
+
+int buf_add_new_node_before_file(buf_t *b, size_t cap) {
+    if (b->len - b->data_in_file >= b->mem_limit) {
+        return BUF_LIMIT;
+    }
+    size_t left_mem = b->mem_limit - b->len + b->data_in_file;
+    if (cap > left_mem) {
+        cap = left_mem;
+    }
+
+    struct buf_node *dest_node =
+        (struct buf_node *)malloc(sizeof(struct buf_node));
+    if (dest_node == NULL) {
+        return BUF_EOM;
+    }
+    int r = buf_node_mem_init(dest_node, cap);
+    if (r < 0) {
+        return r;
+    }
+
+    dest_node->next = b->file_node;
+    if (b->node_before_file) {
+        b->node_before_file->next = dest_node;
+    }
+    b->node_before_file = dest_node;
+
+    return 0;
+}
+
+int buf_file_to_mem(buf_t *b) {
+    if (b->data_in_file == 0) {
+        return buf_remove_file_node(b);
+    }
+
+    if (b->node_before_file == NULL ||
+        BUF_NODE_APPLY(b->node_before_file, is_full)) {
+        int r = buf_add_new_node_before_file(b, 4000);
+        if (r < 0) {
+            return r;
+        }
+    }
+
+    struct buf_node *dest_node = b->node_before_file;
+
+    size_t cnt;
+    int r = BUF_NODE_APPLY(dest_node, read_from_fd,
+                           b->file_node->node_impl.file.fd, &cnt);
+    if (r < 0) {
+        return r;
+    }
+
+    b->data_in_file -= cnt;
+    if (b->data_in_file == 0) {
+        return buf_remove_file_node(b);
+    }
+
+    return 0;
+}
+
+int buf_limit_exceed(buf_t *b, size_t len) {
+    if (!b->file_enable) {
+        return b->len + len - b->data_in_file >= b->mem_limit;
+    } else {
+        return b->len + len > b->total_limit;
     }
 }
 
-int buf_can_push(buf_t *b, size_t len) {
-    // TODO
+size_t buf_count_free_space(buf_t *b) {
+    if (b->file_enable) {
+        return b->total_limit - b->len;
+    }
 }
 
 int buf_push_data_new_node(buf_t *b, unsigned char *data, size_t len) {
@@ -425,14 +571,18 @@ int buf_push_data_new_node(buf_t *b, unsigned char *data, size_t len) {
     return 0;
 }
 
-int buf_push_data(buf_t *b, unsigned char *data, size_t len) {
+int buf_push_back_data(buf_t *b, unsigned char *data, size_t len) {
+    if (buf_limit_exceed(b, len)) {
+        return BUF_LIMIT;
+    }
+
     if (b->tail == NULL || BUF_NODE_APPLY(b->tail, is_full) ||
         BUF_NODE_TYPE(b->tail) == BUF_IMPL_TYPE_FILE) {
         if (buf_push_data_new_node(b, data, len) < 0) {
             return -1;
         }
     } else {
-        int cnt;
+        size_t cnt;
         int r = BUF_NODE_APPLY(b->tail, push_data, data, len, &cnt);
         if (r < 0) {
             return -1;
@@ -443,13 +593,14 @@ int buf_push_data(buf_t *b, unsigned char *data, size_t len) {
             }
         }
     }
+
+    if (b->len - b->data_in_file >= b->mem_limit) {
+        return buf_to_file(b);
+    }
+
     return 0;
 }
 
-/*
-  try read from fd begen with cap of 1500 bytes, if still have data in
-  system cache, enlarge the cap by 1.5, till EGAIN
- */
 int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
     size_t buf_cap = 1500;
     size_t tmp = 0;
@@ -463,6 +614,9 @@ int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
             if (n == NULL) {
                 return BUF_EOM;
             }
+            if (buf_limit_exceed(b, buf_cap)) {
+                buf_cap = buf_count_free_space(b);
+            }
             if (buf_node_mem_init(n, buf_cap) < 0) {
                 return BUF_EOM;
             }
@@ -472,7 +626,13 @@ int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
         if (r != BUF_OK) {
             return r;
         }
+
+        if (buf_limit_exceed(b, 0)) {
+            return 0;
+        }
     }
+
+    return 0;
 }
 
 int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
@@ -480,6 +640,13 @@ int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
     struct buf_node *tmpn = NULL;
     size_t tmp;
     while (n) {
+        if (BUF_NODE_TYPE(n) == BUF_IMPL_TYPE_FILE) {
+            int r = buf_file_to_mem(b);
+            if (r < 0) {
+                return r;
+            }
+        }
+
         b->head = n;
         if (BUF_NODE_APPLY(n, is_empty)) {
             tmpn = n;
