@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,58 +13,6 @@
 #include "buffer.h"
 
 #define BUF_IMPL_TYPE_MEM 0
-
-struct buf_node_virtual_func;
-
-struct buf_node_impl_common {
-    int impl_type;
-    struct buf_node_virtual_func *virtual_fn_ptr;
-};
-
-struct buf_node_impl_mem {
-    struct buf_node_impl_common common;
-
-    size_t len;
-    size_t cap;
-    unsigned char *first;
-    unsigned char *data;
-};
-
-union buf_node_virtual {
-    struct buf_node_impl_common common;
-    struct buf_node_impl_mem mem;
-};
-
-struct buf_node {
-    struct buf_node *next;
-    union buf_node_virtual node_impl;
-};
-
-struct buf_s {
-    size_t len;
-    size_t total_limit;
-    struct buf_node *head;
-    struct buf_node *tail;
-};
-
-struct buf_node_virtual_func {
-    void (*clear)(struct buf_node *n);
-    int (*push_data)(struct buf_node *n, unsigned char *data, size_t len,
-                     size_t *cnt);
-    size_t (*get_cap)(struct buf_node *n);
-    size_t (*get_len)(struct buf_node *n);
-    size_t (*count_free_cap)(struct buf_node *n);
-    void (*set_len)(struct buf_node *n, size_t len);
-    void (*add_len)(struct buf_node *n, size_t delta);
-    int (*is_full)(struct buf_node *n);
-    int (*is_empty)(struct buf_node *n);
-    int (*read_from_fd)(struct buf_node *n, int fd, size_t *cnt);
-    int (*write_to_fd)(struct buf_node *n, int fd, size_t *cnt);
-};
-
-#define BUF_NODE_APPLY(n, fname, ...) \
-    (n)->node_impl.common.virtual_fn_ptr->fname(n, ##__VA_ARGS__)
-#define BUF_NODE_TYPE(n) (n)->node_impl.common.impl_type
 
 /* mem node */
 
@@ -77,6 +27,7 @@ int buf_node_mem_is_empty(struct buf_node *n);
 int buf_node_mem_read_from_fd(struct buf_node *n, int fd, size_t *cnt);
 size_t buf_node_mem_count_free_cap(struct buf_node *n);
 int buf_node_mem_write_to_fd(struct buf_node *n, int fd, size_t *cnt);
+int buf_node_mem_write_to_ssl(struct buf_node *n, SSL *ssl, size_t *cnt);
 
 struct buf_node_virtual_func buf_node_impl_mem_class = {
     .clear = buf_node_mem_clear,
@@ -89,6 +40,7 @@ struct buf_node_virtual_func buf_node_impl_mem_class = {
     .count_free_cap = buf_node_mem_count_free_cap,
     .read_from_fd = buf_node_mem_read_from_fd,
     .write_to_fd = buf_node_mem_write_to_fd,
+    .write_to_ssl = buf_node_mem_write_to_ssl,
 };
 
 int buf_node_mem_init(struct buf_node *n, size_t cap) {
@@ -114,8 +66,10 @@ int buf_node_mem_init_with_data(struct buf_node *n, unsigned char *data,
     if (data == NULL || len == 0) {
         return -1;
     }
-    if (buf_node_mem_init(n, len) < 0) {
-        return -1;
+
+    int r = buf_node_mem_init(n, len);
+    if (r < 0) {
+        return r;
     }
 
     unsigned char *dest = n->node_impl.mem.data;
@@ -129,8 +83,10 @@ int buf_node_mem_init_with_data(struct buf_node *n, unsigned char *data,
 }
 
 void buf_node_mem_clear(struct buf_node *n) {
-    free(n->node_impl.mem.data);
-    n->node_impl.mem.data = NULL;
+    if (n->node_impl.mem.data) {
+        free(n->node_impl.mem.data);
+        n->node_impl.mem.data = NULL;
+    }
     n->node_impl.mem.len = 0;
     n->node_impl.mem.cap = 0;
     n->node_impl.mem.first = NULL;
@@ -138,6 +94,8 @@ void buf_node_mem_clear(struct buf_node *n) {
 
 int buf_node_mem_push_data(struct buf_node *n, unsigned char *data, size_t len,
                            size_t *cnt) {
+    *cnt = 0;
+
     if (data == NULL || len < 0) {
         return -1;
     }
@@ -148,6 +106,7 @@ int buf_node_mem_push_data(struct buf_node *n, unsigned char *data, size_t len,
         if (*ppdata == NULL) {
             return BUF_EOM;
         }
+        n->node_impl.mem.len = 0;
         n->node_impl.mem.cap = len;
         n->node_impl.mem.first = *ppdata;
     }
@@ -231,6 +190,27 @@ int buf_node_mem_write_to_fd(struct buf_node *n, int fd, size_t *cnt) {
     return BUF_OK;
 }
 
+int buf_node_mem_write_to_ssl(struct buf_node *n, SSL *ssl, size_t *cnt) {
+    unsigned char *p = n->node_impl.mem.first;
+    size_t len = buf_node_mem_get_len(n);
+    *cnt = 0;
+    int r = SSL_write(ssl, p, len);
+    if (r > 0) {
+        *cnt += r;
+        len -= r;
+        n->node_impl.mem.first += r;
+        buf_node_mem_set_len(n, len);
+    } else {
+        int err = SSL_get_error(ssl, r);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return BUF_EAGAIN;
+        } else {
+            return BUF_ERR;
+        }
+    }
+    return BUF_OK;
+}
+
 /* buf_t */
 
 int buf_init(buf_t *b) {
@@ -275,7 +255,7 @@ int buf_add_node(buf_t *b, struct buf_node *n) {
     return 0;
 }
 
-void buf_node_clear(buf_t *b) {
+void buf_clear(buf_t *b) {
     struct buf_node **pn = &b->head;
     while (*pn) {
         struct buf_node *t = *pn;
@@ -293,17 +273,19 @@ int buf_limit_exceed(buf_t *b, size_t len) {
 
 size_t buf_count_free_space(buf_t *b) { return b->total_limit - b->len; }
 
+size_t buf_get_len(buf_t *b) { return b->len; }
+
 int buf_push_data_new_node(buf_t *b, unsigned char *data, size_t len) {
     if (buf_limit_exceed(b, len)) {
-        return BUF_EOF;
+        return BUF_LIMIT;
     }
 
-    size_t cap = b->len + (b->len >> 1);  // cap = len * 1.5
-    if (buf_limit_exceed(b, len)) {
-        cap = buf_count_free_space(b);
-    }
+    size_t cap = b->len >> 1;  // cap = len * 0.5
     if (cap < len) {
         cap = len;
+    }
+    if (buf_limit_exceed(b, cap)) {
+        cap = buf_count_free_space(b);
     }
 
     struct buf_node *n = (struct buf_node *)malloc(sizeof(struct buf_node));
@@ -359,7 +341,7 @@ int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
     *cnt = 0;
 
     while (1) {
-        if (buf_limit_exceed(b, 0)) {
+        if (buf_limit_exceed(b, 1)) {
             return BUF_EOM;
         }
 
@@ -373,6 +355,7 @@ int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
                 buf_cap = buf_count_free_space(b);
             }
             if (buf_node_mem_init(n, buf_cap) < 0) {
+                free(n);
                 return BUF_EOM;
             }
             buf_add_node(b, n);
@@ -388,8 +371,8 @@ int buf_read_from_fd(buf_t *b, int fd, size_t *cnt) {
     return 0;
 }
 
-// write data into fd, then drop datas wrote
-int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
+// dest type = 0 for fd, 1 for ssl
+int buf_write(buf_t *b, void *dest, int dest_type, size_t *cnt) {
     struct buf_node *n = b->head;
     struct buf_node *tmpn = NULL;
     size_t tmp;
@@ -405,7 +388,15 @@ int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
             continue;
         }
 
-        int r = BUF_NODE_APPLY(n, write_to_fd, fd, &tmp);
+        int r = 0;
+        if (dest_type == 0) {
+            r = BUF_NODE_APPLY(n, write_to_fd, *(int *)dest, &tmp);
+        } else if (dest_type == 1) {
+            r = BUF_NODE_APPLY(n, write_to_ssl, (SSL *)dest, &tmp);
+        } else {
+            return BUF_ERR;
+        }
+
         b->len -= tmp;
         *cnt += tmp;
         if (r != BUF_OK) {
@@ -424,4 +415,13 @@ int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
     b->head = b->tail = NULL;
 
     return BUF_OK;
+}
+
+// write data into fd, then drop datas have been wrote
+int buf_write_to_fd(buf_t *b, int fd, size_t *cnt) {
+    return buf_write(b, &fd, 0, cnt);
+}
+
+int buf_write_to_ssl(buf_t *b, SSL *ssl, size_t *cnt) {
+    return buf_write(b, ssl, 1, cnt);
 }
